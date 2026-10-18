@@ -1,0 +1,7 @@
+@authorization_code=
+
+GET localhost:3000/sessions/start?code={{authorization_code}}
+
+###
+
+GET localhost:3000/sessions/get
