@@ -24,7 +24,7 @@ impl InMemoryStore {
 
 impl Store for InMemoryStore {
     async fn set(&self, key: &Ticket, value: &SessionState) -> anyhow::Result<()> {
-        println!("Storing {key:?} for {}", value.username);
+        log::info!("Storing {key:?} for {}", value.username);
         self.store
             .lock()
             .await

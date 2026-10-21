@@ -14,8 +14,12 @@ hex = "0.4.3"
 jiff = { version = "0.2.38",features = ["serde"] }
 jsonwebtoken = "10" #waiting for https://github.com/chenhunghan/jwks/pull/32
 jwks = "0.5.3"
+log = "0.4.34"
 oauth2 = { version = "5.0.0"}
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
-tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread",] }
+tokio = { version = "1.54.0", features = ["macros", "rt-multi-thread",] }
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+

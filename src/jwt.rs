@@ -1,6 +1,7 @@
 use anyhow::Context;
 use jsonwebtoken::{TokenData, Validation};
 use jwks::Jwk;
+use log::info;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::mem;
@@ -29,7 +30,7 @@ impl Jwks {
         U: Into<String>,
     {
         let url = url.into();
-        eprintln!("Load keys from {url}");
+        info!("Load keys from {url}");
         jwks::Jwks::from_oidc_url(url)
             .await
             .context("Could not load JWKS")

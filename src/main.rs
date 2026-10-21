@@ -18,9 +18,12 @@ use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::Cookie as HttpCookie;
 use jiff::Timestamp;
+use log::{error, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
 
 // see http://localhost/realms/caessium/.well-known/openid-configuration
 const CLIENT_ID: &str = "caessium";
@@ -37,6 +40,16 @@ const SESSIUM_TOKEN_URL: &str = "/sessions/get";
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        // This allows you to use, e.g., `RUST_LOG=info` or `RUST_LOG=debug`
+        // when running the app to set log levels.
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new("caessium=info,tower_http=warn"))
+                .unwrap(),
+        )
+        .init();
+
     let config = Config::new(
         CLIENT_ID,
         CLIENT_SECRET,
@@ -61,7 +74,8 @@ async fn main() {
                 .await
                 .context("Could not initialize the JWKS")
                 .unwrap(),
-        }));
+        }))
+        .layer(TraceLayer::new_for_http());
 
     println!("Visit {SESSIUM_SESSIUM_BASE_URL}{SESSIUM_LOGIN_URL}");
     axum::serve(listener, app).await.unwrap();
@@ -87,11 +101,11 @@ async fn handle_session_start(
         let username = jwt::validate::<AccessToken>(&state.jwks, &access_token)
             .await
             .map_err(|e| {
-                eprintln!("Could not validate token: {e}");
+                warn!("Could not validate token: {e}");
                 StatusCode::UNAUTHORIZED
             })?
             .ok_or_else(|| {
-                eprintln!("Invalid token");
+                warn!("Invalid token");
                 StatusCode::UNAUTHORIZED
             })?
             .claims
@@ -99,7 +113,7 @@ async fn handle_session_start(
 
         let session_state = SessionState::new(username, access_token, expires_in, refresh_token);
         let ticket = Ticket::generate(&state.config.cookie_name).map_err(|e| {
-            eprintln!("Could not generate ticket: {}", e);
+            error!("Could not generate ticket: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         state
@@ -107,7 +121,7 @@ async fn handle_session_start(
             .set(&ticket, &session_state)
             .await
             .map_err(|e| {
-                eprintln!("Could not persist session state: {}", e);
+                error!("Could not persist session state: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
         let cookie = ticket.into_cookie(&state.config.cookie_name);
