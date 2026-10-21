@@ -1,12 +1,15 @@
 mod config;
+mod jwt;
 mod oidc;
 mod session;
 mod store;
 
 use crate::config::Config;
+use crate::jwt::{AccessToken, Jwks};
 use crate::oidc::OIDCClient;
 use crate::session::{Cookie, SessionState, Ticket};
 use crate::store::{InMemoryStore, Store};
+use anyhow::Context;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect};
@@ -24,6 +27,8 @@ const CLIENT_ID: &str = "caessium";
 const CLIENT_SECRET: &str = "IYa1ukFRJFVbofW5VsGl3b6QbHaEQXPz";
 const AUTH_URL: &str = "http://localhost/realms/caessium/protocol/openid-connect/auth";
 const TOKEN_URL: &str = "http://localhost/realms/caessium/protocol/openid-connect/token";
+
+const OIDC_CONFIG_URL: &str = "http://localhost/realms/caessium/.well-known/openid-configuration";
 
 const SESSIUM_SESSIUM_BASE_URL: &str = "http://localhost:3000";
 const SESSIUM_REDIRECT_URL: &str = "/sessions/start";
@@ -52,6 +57,10 @@ async fn main() {
             oidc_client: OIDCClient::new(&config),
             store: InMemoryStore::new(),
             config,
+            jwks: Jwks::new(OIDC_CONFIG_URL)
+                .await
+                .context("Could not initialize the JWKS")
+                .unwrap(),
         }));
 
     println!("Visit {SESSIUM_SESSIUM_BASE_URL}{SESSIUM_LOGIN_URL}");
@@ -75,9 +84,32 @@ async fn handle_session_start(
                 Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
 
-        let session_state = SessionState::new(access_token, expires_in, refresh_token);
-        let ticket = Ticket::generate(&state.config.cookie_name).unwrap();
-        state.store.set(&ticket, &session_state).await.unwrap();
+        let username = jwt::validate::<AccessToken>(&state.jwks, &access_token)
+            .await
+            .map_err(|e| {
+                eprintln!("Could not validate token: {e}");
+                StatusCode::UNAUTHORIZED
+            })?
+            .ok_or_else(|| {
+                eprintln!("Invalid token");
+                StatusCode::UNAUTHORIZED
+            })?
+            .claims
+            .preferred_username;
+
+        let session_state = SessionState::new(username, access_token, expires_in, refresh_token);
+        let ticket = Ticket::generate(&state.config.cookie_name).map_err(|e| {
+            eprintln!("Could not generate ticket: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        state
+            .store
+            .set(&ticket, &session_state)
+            .await
+            .map_err(|e| {
+                eprintln!("Could not persist session state: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
         let cookie = ticket.into_cookie(&state.config.cookie_name);
 
         let mut http_cookie = HttpCookie::new(
@@ -126,7 +158,11 @@ async fn handle_session_get(
 
         session.update_tokens(access_token, expires_at, refresh_token);
 
-        state.store.set(cookie.ticket(), &session).await.map_err(|_| StatusCode::UNAUTHORIZED)?;
+        state
+            .store
+            .set(cookie.ticket(), &session)
+            .await
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
     }
 
     let mut headers = HeaderMap::new();
@@ -146,4 +182,5 @@ struct AppState {
     config: Config,
     oidc_client: OIDCClient,
     store: InMemoryStore, // todo: actual implementation should come from config
+    jwks: Jwks,
 }

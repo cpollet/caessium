@@ -250,6 +250,8 @@ impl Cookie {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionState {
+    #[serde(rename = "sub")]
+    pub username: String,
     #[serde(rename = "at")]
     pub access_token: String,
     #[serde(rename = "exp")]
@@ -259,16 +261,19 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new<AT, RT>(
+    pub fn new<U, AT, RT>(
+        username: U,
         access_token: AT,
         expires_in: Option<Duration>,
         refresh_token: Option<RT>,
     ) -> Self
     where
+        U: Into<String>,
         AT: Into<String>,
         RT: Into<String>,
     {
         Self {
+            username: username.into(),
             access_token: access_token.into(),
             expires_at: expires_in.map(|d| Timestamp::now().checked_add(d).unwrap()),
             refresh_token: refresh_token.map(|s| s.into()),
@@ -377,7 +382,7 @@ mod tests {
     #[test]
     fn test_ticket_encrypt_decrypt() {
         let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
-        let session_state = SessionState::new("at", None, Some("rt"));
+        let session_state = SessionState::new("username", "at", None, Some("rt"));
         let encrypted_session_state = ticket
             .encrypt(&session_state)
             .expect("Can encrypt session state");

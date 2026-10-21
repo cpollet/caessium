@@ -24,7 +24,7 @@ impl InMemoryStore {
 
 impl Store for InMemoryStore {
     async fn set(&self, key: &Ticket, value: &SessionState) -> anyhow::Result<()> {
-        println!("Storing {key:?}");
+        println!("Storing {key:?} for {}", value.username);
         self.store
             .lock()
             .await
@@ -49,10 +49,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_in_memory_store_set_get() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
         let ticket = Ticket::generate("cookie_name").unwrap();
 
-        let session_state = SessionState::new("at", None, Some("rt"));
+        let session_state = SessionState::new("username", "at", None, Some("rt"));
         store.set(&ticket, &session_state).await.unwrap();
 
         let loaded_session_state = store.get(&ticket).await.unwrap().unwrap();
