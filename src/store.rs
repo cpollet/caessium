@@ -8,9 +8,14 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub trait Store: Send + Sync {
-    async fn set(&self, key: &Ticket, session_state: &SessionState) -> anyhow::Result<()>;
+    async fn set(
+        &self,
+        key: &Ticket,
+        session_state: &SessionState,
+        extend_ttl: bool,
+    ) -> anyhow::Result<()>;
 
-    async fn get(&self, key: &Ticket) -> anyhow::Result<Option<SessionState>>;
+    async fn get(&self, key: &Ticket, extend_ttl: bool) -> anyhow::Result<Option<SessionState>>;
 }
 
 #[allow(unused)]
@@ -28,7 +33,12 @@ impl InMemoryStore {
 }
 
 impl Store for InMemoryStore {
-    async fn set(&self, key: &Ticket, session_state: &SessionState) -> anyhow::Result<()> {
+    async fn set(
+        &self,
+        key: &Ticket,
+        session_state: &SessionState,
+        _extend_ttl: bool,
+    ) -> anyhow::Result<()> {
         log::debug!("Storing {key:?} for {}", session_state.username);
         self.store
             .lock()
@@ -37,7 +47,7 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn get(&self, key: &Ticket) -> anyhow::Result<Option<SessionState>> {
+    async fn get(&self, key: &Ticket, _extend_ttl: bool) -> anyhow::Result<Option<SessionState>> {
         self.store
             .lock()
             .await
@@ -67,17 +77,19 @@ impl RedisStore {
 }
 
 impl Store for RedisStore {
-    async fn set(&self, key: &Ticket, session_state: &SessionState) -> anyhow::Result<()> {
-        log::debug!(
-            "Storing session {} for {} to redis",
-            key.id,
-            session_state.username
-        );
-
-        if let Some(exp) = session_state.expiration() {
+    async fn set(
+        &self,
+        key: &Ticket,
+        session_state: &SessionState,
+        extend_ttl: bool,
+    ) -> anyhow::Result<()> {
+        if let Some(exp) = session_state.expiration()
+            && extend_ttl
+        {
             log::debug!(
-                "Session {key} expires at {exp} (at most at {exp_max})",
+                "Store ession {key} for {username} with expiration at {exp} (max {exp_max})",
                 key = key.id,
+                username = session_state.username,
                 exp_max = session_state.session_expires_at.unwrap_or(exp)
             );
             self.conn
@@ -91,30 +103,41 @@ impl Store for RedisStore {
                 .context("Could not set key")
                 .map(|_| ())
         } else {
+            log::debug!(
+                "Store ession {key} for {username} without expiration",
+                key = key.id,
+                username = session_state.username,
+            );
             self.conn
                 .clone()
-                .set(&key.id, key.encrypt(&session_state)?)
+                .set_options(
+                    &key.id,
+                    key.encrypt(&session_state)?,
+                    SetOptions::default().with_expiration(SetExpiry::KEEPTTL),
+                )
                 .await
                 .context("Could not set key")
                 .map(|_| ())
         }
     }
 
-    async fn get(&self, key: &Ticket) -> anyhow::Result<Option<SessionState>> {
-        log::debug!("Fetching session {key} from redis", key = key.id);
+    async fn get(&self, key: &Ticket, extend_ttl: bool) -> anyhow::Result<Option<SessionState>> {
+        log::debug!("Fetch session {key} from redis", key = key.id);
         let session_state = self
             .conn
             .clone()
-            .get(&key.id) // get_ex (https://redis.io/docs/latest/commands/getex/)
+            .get(&key.id)
             .await
             .context("Could not get key")?
             .map(|s| key.decrypt::<_, SessionState>(&s))
             .transpose();
 
-        if let Ok(Some(session_state)) = &session_state {
+        if let Ok(Some(session_state)) = &session_state
+            && extend_ttl
+        {
             if let Some(exp) = session_state.expiration() {
                 log::debug!(
-                    "Session {key} expires at {exp} (at most at {exp_max})",
+                    "Session {key} now expires at {exp} (max {exp_max})",
                     key = key.id,
                     exp_max = session_state.session_expires_at.unwrap_or(exp)
                 );
@@ -142,9 +165,9 @@ mod tests {
 
         let session_state =
             SessionState::new("username", "at".into(), None, Some("rt".into()), None, None);
-        store.set(&ticket, &session_state).await.unwrap();
+        store.set(&ticket, &session_state, false).await.unwrap();
 
-        let loaded_session_state = store.get(&ticket).await.unwrap().unwrap();
+        let loaded_session_state = store.get(&ticket, false).await.unwrap().unwrap();
 
         assert_eq!(loaded_session_state.access_token, "at".into());
         assert_eq!(loaded_session_state.refresh_token.unwrap(), "rt".into());
@@ -155,7 +178,7 @@ mod tests {
         let store = InMemoryStore::new();
         let ticket = Ticket::generate("cookie_name").unwrap();
 
-        let loaded_session_state = store.get(&ticket).await.unwrap();
+        let loaded_session_state = store.get(&ticket, false).await.unwrap();
         assert!(loaded_session_state.is_none());
     }
 }

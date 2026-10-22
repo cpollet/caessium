@@ -20,6 +20,7 @@ use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::Cookie as HttpCookie;
 use jiff::Timestamp;
 use log::{error, warn};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -126,12 +127,15 @@ async fn handle_session_start(
         })?;
         state
             .store
-            .set(&ticket, &session_state)
+            .set(&ticket, &session_state, true)
             .await
             .map_err(|e| {
                 error!("Could not persist session state: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+
+        log::info!("Created session {}", ticket.id);
+
         let cookie = ticket.into_cookie(&state.config.cookie_name);
 
         let mut http_cookie = HttpCookie::new(
@@ -149,10 +153,16 @@ async fn handle_session_start(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct HandleSessionGetGetParams {
+    extend_ttl: Option<bool>,
+}
 async fn handle_session_get(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<HandleSessionGetGetParams>,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, StatusCode> {
+    log::trace!("handle_session_get: {:?}", params);
     let cookie = jar
         .get(state.config.cookie_name.as_str())
         .ok_or(StatusCode::UNAUTHORIZED)?;
@@ -166,10 +176,13 @@ async fn handle_session_get(
 
     let mut session_state = state
         .store
-        .get(cookie.ticket())
+        .get(cookie.ticket(), params.extend_ttl.unwrap_or_default())
         .await
         .map_err(|_| StatusCode::UNAUTHORIZED)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or_else(|| {
+            log::info!("Session {} is not valid", cookie.ticket().id);
+            StatusCode::UNAUTHORIZED
+        })?;
 
     if session_state.is_access_token_expired()
         && let Some(refresh_token) = &session_state.refresh_token
@@ -184,7 +197,11 @@ async fn handle_session_get(
 
         state
             .store
-            .set(cookie.ticket(), &session_state)
+            .set(
+                cookie.ticket(),
+                &session_state,
+                params.extend_ttl.unwrap_or_default(),
+            )
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
     }
