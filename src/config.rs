@@ -1,13 +1,15 @@
+use crate::secrets::{Secret, SecretString};
+
 pub struct Config {
     pub cookie_name: String,
-    pub cookie_sign_key: Vec<u8>,
+    pub cookie_sign_key: Secret<Vec<u8>>,
     pub oidc: OICDConfig,
     pub http_port: u16,
 }
 
 pub struct OICDConfig {
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: SecretString,
     pub auth_url: String,
     pub token_url: String,
     pub redirect_uri: String,
@@ -23,14 +25,14 @@ impl Config {
     ) -> Self
     where
         ID: Into<String>,
-        Secret: Into<String>,
+        Secret: Into<SecretString>,
         AuthUrl: Into<String>,
         TokenUrl: Into<String>,
         RedirectUri: Into<String>,
     {
         Self {
             cookie_name: "caessium_sid".to_string(),
-            cookie_sign_key: "secret".as_bytes().to_vec(),
+            cookie_sign_key: "secret".as_bytes().to_vec().into(),
             oidc: OICDConfig {
                 client_id: client_id.into(),
                 client_secret: client_secret.into(),

@@ -1,3 +1,4 @@
+use crate::secrets::{Secret, SecretString};
 use aes_gcm::aead::array::Array;
 use aes_gcm::aead::consts::U16;
 use aes_gcm::{
@@ -9,15 +10,18 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use getrandom::Error;
 use jiff::Timestamp;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::digest::Output;
 use sha2::{Digest, Sha256};
+use std::fmt::{Debug, Display};
 use std::time::Duration;
+use zeroize::Zeroize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Ticket {
-    pub ticket_id: String,
-    secret: Array<u8, U16>,
+    pub id: String,
+    secret: Secret<Array<u8, U16>>,
 }
 
 impl Ticket {
@@ -26,20 +30,22 @@ impl Ticket {
         getrandom::fill(&mut buf)?;
 
         Ok(Self {
-            ticket_id: format!("{cookie_name}-{id}", id = hex::encode(buf)),
-            secret: Key::<Aes128Gcm>::generate(),
+            id: format!("{cookie_name}-{id}", id = hex::encode(buf)),
+            secret: Key::<Aes128Gcm>::generate().into(),
         })
     }
 
     /// Ticket is serialized as `{version} + '.' + {ticketId as base64} + '.' + {secret as base64}`
-    pub fn serialize(&self) -> String {
+    pub fn serialize(&self) -> SecretString {
         format!(
             "0.{ticket_id}.{secret}",
-            ticket_id = BASE64_URL_SAFE_NO_PAD.encode(self.ticket_id.as_bytes()),
-            secret = BASE64_URL_SAFE_NO_PAD.encode(self.secret.0.as_slice())
+            ticket_id = BASE64_URL_SAFE_NO_PAD.encode(self.id.as_bytes()),
+            secret = BASE64_URL_SAFE_NO_PAD.encode(self.secret.as_secret_ref())
         )
+        .into()
     }
 
+    //todo: the `ticket` param should be `Secret`
     pub fn deserialize(ticket: &str) -> anyhow::Result<Ticket> {
         let mut parts = ticket.split(".");
 
@@ -55,9 +61,12 @@ impl Ticket {
                     bail!("Ticket ID cannot be empty");
                 }
 
-                let mut secret = [0u8; 16];
+                let mut secret = Secret::from(Array::from([0u8; 16]));
                 BASE64_URL_SAFE_NO_PAD
-                    .decode_slice(parts.next().context("Missing secret")?, &mut secret)
+                    .decode_slice(
+                        parts.next().context("Missing secret")?,
+                        secret.as_secret_mut(),
+                    )
                     .context("Invalid secret")?;
 
                 if parts.next().is_some() {
@@ -65,8 +74,8 @@ impl Ticket {
                 }
 
                 Ok(Ticket {
-                    ticket_id: String::from_utf8(ticket_id).context("Invalid ticket ID")?,
-                    secret: From::from(secret),
+                    id: String::from_utf8(ticket_id).context("Invalid ticket ID")?,
+                    secret,
                 })
             }
             _ => Err(anyhow!("Unsupported ticket version")),
@@ -77,52 +86,38 @@ impl Ticket {
         Cookie::new(cookie_name, self)
     }
 
-    pub fn encrypt(&self, session_state: &SessionState) -> anyhow::Result<String> {
+    pub fn encrypt<T>(&self, session_state: &T) -> anyhow::Result<String>
+    where
+        T: Serialize,
+    {
         let session_state =
             serde_json::to_string(session_state).context("Failed to serialize session state")?;
-        Ok(BASE64_URL_SAFE_NO_PAD.encode(self.encrypt_int(session_state)?))
-    }
 
-    fn encrypt_int<P>(&self, payload: P) -> anyhow::Result<Vec<u8>>
-    where
-        P: AsRef<[u8]>,
-    {
         let nonce = Nonce::generate();
 
         let mut ciphertext = self
             .cipher()
-            .encrypt(&nonce, payload.as_ref())
+            .encrypt(&nonce, session_state.as_ref())
             .context("Encryption failed")?;
 
         ciphertext.extend_from_slice(nonce.as_slice());
 
-        Ok(ciphertext)
+        Ok(BASE64_URL_SAFE_NO_PAD.encode(ciphertext))
     }
 
     fn cipher(&self) -> Aes128Gcm {
-        Aes128Gcm::new(&self.secret)
+        Aes128Gcm::new(self.secret.as_secret_ref())
     }
 
-    pub fn decrypt<S>(&self, payload: S) -> anyhow::Result<SessionState>
+    // todo: the `payload` should be `Secret`
+    pub fn decrypt<S, T>(&self, payload: S) -> anyhow::Result<T>
     where
         S: AsRef<str>,
+        T: DeserializeOwned,
     {
-        serde_json::from_slice::<SessionState>(
-            self.decrypt_int(
-                BASE64_URL_SAFE_NO_PAD
-                    .decode(payload.as_ref().as_bytes())
-                    .context("Invalid encoding")?,
-            )?
-            .as_slice(),
-        )
-        .context("Failed to deserialize session state")
-    }
-
-    fn decrypt_int<P>(&self, payload: P) -> anyhow::Result<Vec<u8>>
-    where
-        P: AsRef<[u8]>,
-    {
-        let payload = payload.as_ref();
+        let payload = BASE64_URL_SAFE_NO_PAD
+            .decode(payload.as_ref().as_bytes())
+            .context("Invalid encoding")?;
 
         const NONCE_SIZE: usize = 12;
         if payload.len() < NONCE_SIZE {
@@ -134,9 +129,19 @@ impl Ticket {
 
         let ciphertext = &payload[..payload.len() - NONCE_SIZE];
 
-        self.cipher()
+        let cleartext = self
+            .cipher()
             .decrypt(nonce, ciphertext)
-            .context("Could not decrypt")
+            .context("Could not decrypt")?;
+
+        serde_json::from_slice::<T>(cleartext.as_slice())
+            .context("Failed to deserialize session state")
+    }
+}
+
+impl Display for Ticket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TicketId={}", self.id)
     }
 }
 
@@ -157,26 +162,31 @@ impl Cookie {
         }
     }
 
-    pub fn serialize<S>(&self, secret: S) -> String
+    pub fn serialize<S>(&self, cookie_signing_key: &Secret<S>) -> SecretString
     where
-        S: AsRef<[u8]>,
+        S: AsRef<[u8]> + Zeroize,
     {
         let ticket = self.ticket.serialize();
         let timestamp = self.timestamp.to_string();
 
-        let signature = BASE64_URL_SAFE_NO_PAD
-            .encode(Cookie::sign(secret, &[&"0", &self.name, &ticket, &timestamp]).as_slice());
+        let signature = BASE64_URL_SAFE_NO_PAD.encode(
+            Cookie::sign(
+                cookie_signing_key,
+                &[&"0", &self.name, ticket.as_secret_ref(), &timestamp],
+            )
+            .as_slice(),
+        );
 
-        format!("0|{}|{}|{}", ticket, timestamp, signature)
+        format!("0|{}|{}|{}", ticket.as_secret_ref(), timestamp, signature).into()
     }
 
-    fn sign<K>(key: K, vals: &[&dyn AsRef<[u8]>]) -> Output<Sha256>
+    fn sign<K>(key: &Secret<K>, vals: &[&dyn AsRef<[u8]>]) -> Output<Sha256>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Zeroize,
     {
         let mut hasher = Sha256::new();
 
-        hasher.update(key.as_ref());
+        hasher.update(key.as_secret_ref());
 
         for val in vals {
             hasher.update(val.as_ref());
@@ -185,10 +195,14 @@ impl Cookie {
         hasher.finalize()
     }
 
-    pub fn deserialize<C, S>(cookie: C, cookie_name: &str, secret: S) -> anyhow::Result<Cookie>
+    pub fn deserialize<C, S>(
+        cookie: C,
+        cookie_name: &str,
+        cookie_signing_key: &Secret<S>,
+    ) -> anyhow::Result<Cookie>
     where
         C: AsRef<str>,
-        S: AsRef<[u8]>,
+        S: AsRef<[u8]> + Zeroize,
     {
         let mut parts = cookie.as_ref().split("|");
         let version = parts.next().context("Missing version")?;
@@ -202,7 +216,11 @@ impl Cookie {
                 }
 
                 let expected_signature = BASE64_URL_SAFE_NO_PAD.encode(
-                    Cookie::sign(secret, &[&version, &cookie_name, &ticket, &timestamp]).as_slice(),
+                    Cookie::sign(
+                        cookie_signing_key,
+                        &[&version, &cookie_name, &ticket, &timestamp],
+                    )
+                    .as_slice(),
                 );
 
                 if actual_signature != expected_signature {
@@ -253,30 +271,30 @@ pub struct SessionState {
     #[serde(rename = "sub")]
     pub username: String,
     #[serde(rename = "at")]
-    pub access_token: String,
+    pub access_token: SecretString,
     #[serde(rename = "exp")]
     pub expires_at: Option<Timestamp>,
     #[serde(rename = "rt")]
-    pub refresh_token: Option<String>,
+    pub refresh_token: Option<SecretString>,
 }
 
 impl SessionState {
     pub fn new<U, AT, RT>(
         username: U,
-        access_token: AT,
+        access_token: Secret<AT>,
         expires_in: Option<Duration>,
-        refresh_token: Option<RT>,
+        refresh_token: Option<Secret<RT>>,
     ) -> Self
     where
         U: Into<String>,
-        AT: Into<String>,
-        RT: Into<String>,
+        AT: Into<String> + Default + Zeroize,
+        RT: Into<String> + Default + Zeroize,
     {
         Self {
             username: username.into(),
-            access_token: access_token.into(),
+            access_token: access_token.inner_into(),
             expires_at: expires_in.map(|d| Timestamp::now().checked_add(d).unwrap()),
-            refresh_token: refresh_token.map(|s| s.into()),
+            refresh_token: refresh_token.map(|s| s.inner_into()),
         }
     }
 
@@ -289,34 +307,54 @@ impl SessionState {
 
     pub fn update_tokens<AT, RT>(
         &mut self,
-        access_token: AT,
+        access_token: Secret<AT>,
         expires_in: Option<Duration>,
-        refresh_token: Option<RT>,
+        refresh_token: Option<Secret<RT>>,
     ) where
-        AT: Into<String>,
-        RT: Into<String>,
+        AT: Into<String> + Default + Zeroize,
+        RT: Into<String> + Default + Zeroize,
     {
-        self.access_token = access_token.into();
+        self.access_token = access_token.inner_into();
         self.expires_at = expires_in.map(|d| Timestamp::now().checked_add(d).unwrap());
-        self.refresh_token = refresh_token.map(|s| s.into());
+        self.refresh_token = refresh_token.map(|s| s.inner_into());
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::secrets::Secret;
     use crate::session::{Cookie, SessionState, Ticket};
     use base64::Engine;
     use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-    use std::time::Duration;
+    use std::cell::LazyCell;
+
+    const SINGING_KEY: LazyCell<Secret<String>> =
+        LazyCell::new(|| Secret::from("secret_key".to_string()));
+
+    #[test]
+    fn test_ticket_debug() {
+        let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
+        let debug = format!("{:?}", ticket);
+        assert!(debug.contains(&ticket.id), "ticket id not present");
+        assert!(debug.contains("secret: [redacted]"), "secret not present");
+    }
+
+    #[test]
+    fn test_ticket_display() {
+        let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
+        let display = format!("{}", ticket);
+        assert!(display.contains(&ticket.id), "ticket id not present");
+        assert!(!display.contains("[redacted]"), "secret not present");
+    }
 
     #[test]
     fn test_ticket_serialize_deserialize() {
         let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
         let serialized_ticket = ticket.serialize();
         let deserialized_ticket =
-            Ticket::deserialize(&serialized_ticket).expect("Can deserialize ticket");
+            Ticket::deserialize(serialized_ticket.as_secret_ref()).expect("Can deserialize ticket");
 
-        assert_eq!(deserialized_ticket.ticket_id, ticket.ticket_id,);
+        assert_eq!(deserialized_ticket.id, ticket.id,);
         assert_eq!(deserialized_ticket.secret, ticket.secret,);
     }
 
@@ -382,12 +420,12 @@ mod tests {
     #[test]
     fn test_ticket_encrypt_decrypt() {
         let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
-        let session_state = SessionState::new("username", "at", None, Some("rt"));
+        let session_state = SessionState::new("username", "at".into(), None, Some("rt".into()));
         let encrypted_session_state = ticket
             .encrypt(&session_state)
             .expect("Can encrypt session state");
         let decrypted_session_state = ticket
-            .decrypt(encrypted_session_state)
+            .decrypt::<_, SessionState>(encrypted_session_state)
             .expect("Can decrypt session state");
 
         assert_eq!(
@@ -404,7 +442,7 @@ mod tests {
     fn test_ticket_decrypt_invalid_encoding() {
         let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
         let decrypted_session_state_err = ticket
-            .decrypt("invalid")
+            .decrypt::<_, SessionState>("invalid")
             .expect_err("Can decrypt session state");
 
         assert_eq!(decrypted_session_state_err.to_string(), "Invalid encoding");
@@ -414,7 +452,7 @@ mod tests {
     fn test_ticket_decrypt_invalid_payload_size() {
         let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
         let decrypted_session_state_err = ticket
-            .decrypt(BASE64_URL_SAFE_NO_PAD.encode("invalid"))
+            .decrypt::<_, SessionState>(BASE64_URL_SAFE_NO_PAD.encode("invalid"))
             .expect_err("Can decrypt session state");
 
         assert_eq!(
@@ -427,7 +465,7 @@ mod tests {
     fn test_ticket_decrypt_invalid_payload() {
         let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
         let decrypted_session_state_err = ticket
-            .decrypt("RVptNnl0aHlLQk52NnN5Y0x0d3BhVFkzcHo4cXgz")
+            .decrypt::<_, SessionState>("RVptNnl0aHlLQk52NnN5Y0x0d3BhVFkzcHo4cXgz")
             .expect_err("Can decrypt session state");
 
         assert_eq!(decrypted_session_state_err.to_string(), "Could not decrypt");
@@ -438,23 +476,23 @@ mod tests {
         let cookie = Ticket::generate("cookie_name")
             .expect("Can generate ticket")
             .into_cookie("cookie_name");
-        let serialized_cookie = cookie.serialize("secret_key");
-        let deserialized_cookie =
-            Cookie::deserialize(serialized_cookie, "cookie_name", "secret_key")
-                .expect("Can deserialize cookie");
+        let serialized_cookie = cookie.serialize(&SINGING_KEY);
+        let deserialized_cookie = Cookie::deserialize(
+            serialized_cookie.as_secret_ref(),
+            "cookie_name",
+            &SINGING_KEY,
+        )
+        .expect("Can deserialize cookie");
 
         assert_eq!(deserialized_cookie.name, cookie.name);
         assert_eq!(deserialized_cookie.timestamp, cookie.timestamp);
-        assert_eq!(
-            deserialized_cookie.ticket.ticket_id,
-            cookie.ticket.ticket_id
-        );
+        assert_eq!(deserialized_cookie.ticket.id, cookie.ticket.id);
         assert_eq!(deserialized_cookie.ticket.secret, cookie.ticket.secret);
     }
 
     #[test]
     fn test_cookie_deserialize_invalid_version() {
-        let deserialized_cookie_err = Cookie::deserialize("1.", "cookie_name", "secret_key")
+        let deserialized_cookie_err = Cookie::deserialize("1.", "cookie_name", &SINGING_KEY)
             .expect_err("Can deserialize cookie");
 
         assert_eq!(deserialized_cookie_err.to_string(), "Unsupported version");
@@ -462,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_cookie_deserialize_missing_ticket() {
-        let deserialized_cookie_err = Cookie::deserialize("0", "cookie_name", "secret_key")
+        let deserialized_cookie_err = Cookie::deserialize("0", "cookie_name", &SINGING_KEY)
             .expect_err("Can deserialize cookie");
 
         assert_eq!(deserialized_cookie_err.to_string(), "Missing ticket");
@@ -470,7 +508,7 @@ mod tests {
 
     #[test]
     fn test_cookie_deserialize_missing_timestamp() {
-        let deserialized_cookie_err = Cookie::deserialize("0|ticket", "cookie_name", "secret_key")
+        let deserialized_cookie_err = Cookie::deserialize("0|ticket", "cookie_name", &SINGING_KEY)
             .expect_err("Can deserialize cookie");
 
         assert_eq!(deserialized_cookie_err.to_string(), "Missing timestamp");
@@ -479,7 +517,7 @@ mod tests {
     #[test]
     fn test_cookie_deserialize_missing_signature() {
         let deserialized_cookie_err =
-            Cookie::deserialize("0|ticket|timestamp", "cookie_name", "secret_key")
+            Cookie::deserialize("0|ticket|timestamp", "cookie_name", &SINGING_KEY)
                 .expect_err("Can deserialize cookie");
 
         assert_eq!(deserialized_cookie_err.to_string(), "Missing signature");
@@ -488,7 +526,7 @@ mod tests {
     #[test]
     fn test_cookie_deserialize_invalid_format() {
         let deserialized_cookie_err =
-            Cookie::deserialize("0|ticket|timestamp|signature|", "cookie_name", "secret_key")
+            Cookie::deserialize("0|ticket|timestamp|signature|", "cookie_name", &SINGING_KEY)
                 .expect_err("Can deserialize cookie");
 
         assert_eq!(deserialized_cookie_err.to_string(), "Invalid format");
@@ -497,7 +535,7 @@ mod tests {
     #[test]
     fn test_cookie_deserialize_invalid_signature() {
         let deserialized_cookie_err =
-            Cookie::deserialize("0|ticket|timestamp|signature", "cookie_name", "secret_key")
+            Cookie::deserialize("0|ticket|timestamp|signature", "cookie_name", &SINGING_KEY)
                 .expect_err("Can deserialize cookie");
 
         assert_eq!(deserialized_cookie_err.to_string(), "Invalid signature");

@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aes-gcm = "0.11.1"
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+# because aes-gcm's feature zeroize does not propagate to hybrid-array
+hybrid-array = { version = "*", features = ["zeroize"] }
 anyhow = "1.0.104"
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["cookie"] }
@@ -22,4 +24,5 @@ sha2 = "0.11.1"
 tokio = { version = "1.54.0", features = ["macros", "rt-multi-thread",] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zeroize = { version = "1.9.1" }
 

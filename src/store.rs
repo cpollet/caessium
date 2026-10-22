@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub trait Store: Send + Sync {
-    async fn set(&self, key: &Ticket, value: &SessionState) -> anyhow::Result<()>;
+    async fn set(&self, key: &Ticket, session_state: &SessionState) -> anyhow::Result<()>;
 
     async fn get(&self, key: &Ticket) -> anyhow::Result<Option<SessionState>>;
 }
@@ -23,12 +23,12 @@ impl InMemoryStore {
 }
 
 impl Store for InMemoryStore {
-    async fn set(&self, key: &Ticket, value: &SessionState) -> anyhow::Result<()> {
-        log::info!("Storing {key:?} for {}", value.username);
+    async fn set(&self, key: &Ticket, session_state: &SessionState) -> anyhow::Result<()> {
+        log::info!("Storing {key:?} for {}", session_state.username);
         self.store
             .lock()
             .await
-            .insert(key.ticket_id.clone(), key.encrypt(value)?);
+            .insert(key.id.clone(), key.encrypt(&session_state)?);
         Ok(())
     }
 
@@ -36,7 +36,7 @@ impl Store for InMemoryStore {
         self.store
             .lock()
             .await
-            .get(&key.ticket_id)
+            .get(&key.id)
             .map(|s| key.decrypt(s))
             .transpose()
     }
@@ -52,19 +52,13 @@ mod tests {
         let store = InMemoryStore::new();
         let ticket = Ticket::generate("cookie_name").unwrap();
 
-        let session_state = SessionState::new("username", "at", None, Some("rt"));
+        let session_state = SessionState::new("username", "at".into(), None, Some("rt".into()));
         store.set(&ticket, &session_state).await.unwrap();
 
         let loaded_session_state = store.get(&ticket).await.unwrap().unwrap();
 
-        assert_eq!(
-            loaded_session_state.access_token,
-            session_state.access_token
-        );
-        assert_eq!(
-            loaded_session_state.refresh_token,
-            session_state.refresh_token
-        );
+        assert_eq!(loaded_session_state.access_token, "at".into());
+        assert_eq!(loaded_session_state.refresh_token.unwrap(), "rt".into());
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::secrets::SecretString;
 use anyhow::Context;
 use oauth2::basic::*;
 use oauth2::http::{HeaderMap, HeaderValue};
@@ -30,7 +31,9 @@ impl OIDCClient {
 
         Self {
             client: BasicClient::new(ClientId::new(config.oidc.client_id.clone()))
-                .set_client_secret(ClientSecret::new(config.oidc.client_secret.clone()))
+                .set_client_secret(ClientSecret::new(
+                    config.oidc.client_secret.clone().secret(),
+                ))
                 .set_auth_uri(AuthUrl::new(config.oidc.auth_url.clone()).unwrap())
                 .set_token_uri(TokenUrl::new(config.oidc.token_url.clone()).unwrap())
                 // Set the URL the user will be redirected to after the authorization process.
@@ -70,7 +73,7 @@ impl OIDCClient {
         &self,
         authorization_code: C,
         pkce_verifier: Option<PkceCodeVerifier>,
-    ) -> anyhow::Result<(String, Option<Duration>, Option<String>)>
+    ) -> anyhow::Result<(SecretString, Option<Duration>, Option<SecretString>)>
     where
         C: Into<String>,
     {
@@ -91,20 +94,20 @@ impl OIDCClient {
         //dbg!(&res);
 
         Ok((
-            res.access_token().secret().clone(),
+            res.access_token().into(),
             res.expires_in(),
-            res.refresh_token().map(|t| t.secret().clone()),
+            res.refresh_token().map(Into::into),
         ))
     }
 
     pub async fn refresh<S>(
         &self,
         refresh_token: S,
-    ) -> anyhow::Result<(String, Option<Duration>, Option<String>)>
+    ) -> anyhow::Result<(SecretString, Option<Duration>, Option<SecretString>)>
     where
-        S: Into<String>,
+        S: AsRef<SecretString>,
     {
-        let refresh_token = RefreshToken::new(refresh_token.into());
+        let refresh_token = RefreshToken::new(refresh_token.as_ref().clone_secret());
         let req = self.client.exchange_refresh_token(&refresh_token);
 
         let res = req
@@ -114,9 +117,9 @@ impl OIDCClient {
         //dbg!(&res);
 
         Ok((
-            res.access_token().secret().clone(),
+            res.access_token().into(),
             res.expires_in(),
-            res.refresh_token().map(|t| t.secret().clone()),
+            res.refresh_token().map(Into::into),
         ))
     }
 }

@@ -1,3 +1,4 @@
+use crate::secrets::SecretString;
 use anyhow::Context;
 use jsonwebtoken::{TokenData, Validation};
 use jwks::Jwk;
@@ -63,12 +64,15 @@ impl Jwks {
     }
 }
 
-pub async fn validate<T>(jwks: &Jwks, access_token: &str) -> anyhow::Result<Option<TokenData<T>>>
+pub async fn validate<T>(
+    jwks: &Jwks,
+    access_token: &SecretString,
+) -> anyhow::Result<Option<TokenData<T>>>
 where
     T: DeserializeOwned,
 {
-    let header =
-        jsonwebtoken::decode_header(access_token).context("Error decoding access token header")?;
+    let header = jsonwebtoken::decode_header(access_token.as_secret_ref())
+        .context("Error decoding access token header")?;
     let kid = header.kid.context("No kid found in header")?;
 
     let key = jwks
@@ -85,7 +89,10 @@ where
     // validation.set_issuer(&["..."]);
     // validation.set_audience(&["..."]);
 
-    Ok(jsonwebtoken::decode::<T>(&access_token, &key.decoding_key, &validation).ok())
+    Ok(
+        jsonwebtoken::decode::<T>(access_token.as_secret_ref(), &key.decoding_key, &validation)
+            .ok(),
+    )
 }
 
 #[derive(Deserialize)]

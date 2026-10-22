@@ -1,6 +1,7 @@
 mod config;
 mod jwt;
 mod oidc;
+mod secrets;
 mod session;
 mod store;
 
@@ -45,7 +46,7 @@ async fn main() {
         // when running the app to set log levels.
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new("caessium=info,tower_http=warn"))
+                .or_else(|_| EnvFilter::try_new("caessium=debug,tower_http=warn"))
                 .unwrap(),
         )
         .init();
@@ -128,7 +129,9 @@ async fn handle_session_start(
 
         let mut http_cookie = HttpCookie::new(
             state.config.cookie_name.clone(),
-            cookie.serialize(&state.config.cookie_sign_key),
+            // fixme: here we 'leak' the session state encryption key as the serialized cookie
+            //  contains it in cleartext
+            cookie.serialize(&state.config.cookie_sign_key).secret(),
         );
         http_cookie.set_path("/");
         http_cookie.set_secure(true);
@@ -154,15 +157,15 @@ async fn handle_session_get(
     )
     .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    let mut session = state
+    let mut session_state = state
         .store
         .get(cookie.ticket())
         .await
         .map_err(|_| StatusCode::UNAUTHORIZED)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    if session.is_expired()
-        && let Some(refresh_token) = &session.refresh_token
+    if session_state.is_expired()
+        && let Some(refresh_token) = &session_state.refresh_token
     {
         let (access_token, expires_at, refresh_token) = state
             .oidc_client
@@ -170,17 +173,17 @@ async fn handle_session_get(
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-        session.update_tokens(access_token, expires_at, refresh_token);
+        session_state.update_tokens(access_token, expires_at, refresh_token);
 
         state
             .store
-            .set(cookie.ticket(), &session)
+            .set(cookie.ticket(), &session_state)
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
     }
 
     let mut headers = HeaderMap::new();
-    if let Some(expires_at) = session.expires_at {
+    if let Some(expires_at) = session_state.expires_at {
         let max_age = expires_at - Timestamp::now();
         let max_age = max_age.get_seconds() - 5;
         headers.insert(
@@ -189,7 +192,7 @@ async fn handle_session_get(
         );
     }
 
-    Ok((headers, Json(session.access_token)))
+    Ok((headers, Json(session_state.access_token)))
 }
 
 struct AppState {
