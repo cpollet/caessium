@@ -1,18 +1,12 @@
 use crate::secrets::{Secret, SecretString};
+use std::time::Duration;
 
 pub struct Config {
     pub cookie_name: String,
     pub cookie_sign_key: Secret<Vec<u8>>,
     pub oidc: OICDConfig,
     pub http_port: u16,
-}
-
-pub struct OICDConfig {
-    pub client_id: String,
-    pub client_secret: SecretString,
-    pub auth_url: String,
-    pub token_url: String,
-    pub redirect_uri: String,
+    pub session: Session,
 }
 
 impl Config {
@@ -41,6 +35,23 @@ impl Config {
                 redirect_uri: redirect_url.into(),
             },
             http_port: 3000,
+            session: Session {
+                idle_timeout: Some(Duration::from_secs(15)),
+                hard_timeout: Some(Duration::from_mins(1)),
+            },
         }
     }
+}
+
+pub struct Session {
+    pub idle_timeout: Option<Duration>,
+    pub hard_timeout: Option<Duration>,
+}
+
+pub struct OICDConfig {
+    pub client_id: String,
+    pub client_secret: SecretString,
+    pub auth_url: String,
+    pub token_url: String,
+    pub redirect_uri: String,
 }

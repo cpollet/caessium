@@ -65,6 +65,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
+1
+  redis:
+    image: redis:8.10
+    ports:
+      - "6379:6379"
 volumes:
   keycloak_postgres_data:

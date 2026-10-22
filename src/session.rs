@@ -273,17 +273,23 @@ pub struct SessionState {
     #[serde(rename = "at")]
     pub access_token: SecretString,
     #[serde(rename = "exp")]
-    pub expires_at: Option<Timestamp>,
+    pub access_token_expires_at: Option<Timestamp>,
     #[serde(rename = "rt")]
     pub refresh_token: Option<SecretString>,
+    /// hard session timeout
+    pub session_expires_at: Option<Timestamp>,
+    pub session_idle_timeout: Option<Duration>,
 }
 
 impl SessionState {
+    // todo builder/wither
     pub fn new<U, AT, RT>(
         username: U,
         access_token: Secret<AT>,
         expires_in: Option<Duration>,
         refresh_token: Option<Secret<RT>>,
+        session_expires_in: Option<Duration>,
+        session_idle_timeout: Option<Duration>,
     ) -> Self
     where
         U: Into<String>,
@@ -293,13 +299,16 @@ impl SessionState {
         Self {
             username: username.into(),
             access_token: access_token.inner_into(),
-            expires_at: expires_in.map(|d| Timestamp::now().checked_add(d).unwrap()),
+            access_token_expires_at: expires_in.map(|d| Timestamp::now().checked_add(d).unwrap()),
             refresh_token: refresh_token.map(|s| s.inner_into()),
+            session_expires_at: session_expires_in
+                .map(|d| Timestamp::now().checked_add(d).unwrap()),
+            session_idle_timeout,
         }
     }
 
-    pub fn is_expired(&self) -> bool {
-        match self.expires_at {
+    pub fn is_access_token_expired(&self) -> bool {
+        match self.access_token_expires_at {
             None => false,
             Some(expires_at) => expires_at <= Timestamp::now(),
         }
@@ -308,15 +317,40 @@ impl SessionState {
     pub fn update_tokens<AT, RT>(
         &mut self,
         access_token: Secret<AT>,
-        expires_in: Option<Duration>,
+        access_token_expires_in: Option<Duration>,
         refresh_token: Option<Secret<RT>>,
     ) where
         AT: Into<String> + Default + Zeroize,
         RT: Into<String> + Default + Zeroize,
     {
-        self.access_token = access_token.inner_into();
-        self.expires_at = expires_in.map(|d| Timestamp::now().checked_add(d).unwrap());
+        let access_token = access_token.inner_into();
+        if self.access_token != access_token {
+            log::trace!("access_token updated");
+        }
+        self.access_token = access_token;
+
+        self.access_token_expires_at =
+            access_token_expires_in.map(|d| Timestamp::now().checked_add(d).unwrap());
+
+        let refresh_token = refresh_token.map(|r| r.inner_into());
+        if self.refresh_token != refresh_token {
+            log::trace!("refresh_token updated");
+        }
         self.refresh_token = refresh_token.map(|s| s.inner_into());
+    }
+
+    pub fn expiration(&self) -> Option<Timestamp> {
+        let idle_exp = self
+            .session_idle_timeout
+            .map(|d| Timestamp::now().checked_add(d).unwrap())
+            .or(self.session_expires_at);
+
+        match (idle_exp, self.session_expires_at) {
+            (Some(idle_exp), Some(hard_exp)) => Some(idle_exp.min(hard_exp)),
+            (Some(idle_exp), None) => Some(idle_exp),
+            (None, Some(hard_exp)) => Some(hard_exp),
+            (None, None) => None,
+        }
     }
 }
 
@@ -327,6 +361,7 @@ mod tests {
     use base64::Engine;
     use base64::prelude::BASE64_URL_SAFE_NO_PAD;
     use std::cell::LazyCell;
+    use std::time::Duration;
 
     const SINGING_KEY: LazyCell<Secret<String>> =
         LazyCell::new(|| Secret::from("secret_key".to_string()));
@@ -420,7 +455,8 @@ mod tests {
     #[test]
     fn test_ticket_encrypt_decrypt() {
         let ticket = Ticket::generate("cookie_name").expect("Can generate ticket");
-        let session_state = SessionState::new("username", "at".into(), None, Some("rt".into()));
+        let session_state =
+            SessionState::new("username", "at".into(), None, Some("rt".into()), None, None);
         let encrypted_session_state = ticket
             .encrypt(&session_state)
             .expect("Can encrypt session state");

@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::jwt::{AccessToken, Jwks};
 use crate::oidc::OIDCClient;
 use crate::session::{Cookie, SessionState, Ticket};
-use crate::store::{InMemoryStore, Store};
+use crate::store::{RedisStore, Store};
 use anyhow::Context;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -46,7 +46,7 @@ async fn main() {
         // when running the app to set log levels.
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new("caessium=debug,tower_http=warn"))
+                .or_else(|_| EnvFilter::try_new("caessium=trace,tower_http=warn"))
                 .unwrap(),
         )
         .init();
@@ -69,7 +69,7 @@ async fn main() {
         .route(SESSIUM_TOKEN_URL, get(handle_session_get))
         .with_state(Arc::new(AppState {
             oidc_client: OIDCClient::new(&config),
-            store: InMemoryStore::new(),
+            store: RedisStore::new("redis://localhost:6379").await.unwrap(),
             config,
             jwks: Jwks::new(OIDC_CONFIG_URL)
                 .await
@@ -112,7 +112,14 @@ async fn handle_session_start(
             .claims
             .preferred_username;
 
-        let session_state = SessionState::new(username, access_token, expires_in, refresh_token);
+        let session_state = SessionState::new(
+            username,
+            access_token,
+            expires_in,
+            refresh_token,
+            state.config.session.hard_timeout,
+            state.config.session.idle_timeout,
+        );
         let ticket = Ticket::generate(&state.config.cookie_name).map_err(|e| {
             error!("Could not generate ticket: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -164,7 +171,7 @@ async fn handle_session_get(
         .map_err(|_| StatusCode::UNAUTHORIZED)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    if session_state.is_expired()
+    if session_state.is_access_token_expired()
         && let Some(refresh_token) = &session_state.refresh_token
     {
         let (access_token, expires_at, refresh_token) = state
@@ -183,7 +190,7 @@ async fn handle_session_get(
     }
 
     let mut headers = HeaderMap::new();
-    if let Some(expires_at) = session_state.expires_at {
+    if let Some(expires_at) = session_state.access_token_expires_at {
         let max_age = expires_at - Timestamp::now();
         let max_age = max_age.get_seconds() - 5;
         headers.insert(
@@ -198,6 +205,6 @@ async fn handle_session_get(
 struct AppState {
     config: Config,
     oidc_client: OIDCClient,
-    store: InMemoryStore, // todo: actual implementation should come from config
+    store: RedisStore, // todo: actual implementation should come from config
     jwks: Jwks,
 }

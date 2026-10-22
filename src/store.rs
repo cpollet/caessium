@@ -1,6 +1,9 @@
 use crate::session::{SessionState, Ticket};
 use std::collections::HashMap;
 
+use anyhow::Context;
+use redis::aio::MultiplexedConnection;
+use redis::{AsyncTypedCommands, IntoConnectionInfo, SetExpiry, SetOptions};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -10,10 +13,12 @@ pub trait Store: Send + Sync {
     async fn get(&self, key: &Ticket) -> anyhow::Result<Option<SessionState>>;
 }
 
+#[allow(unused)]
 pub struct InMemoryStore {
     store: Arc<Mutex<HashMap<String, String>>>,
 }
 
+#[allow(unused)]
 impl InMemoryStore {
     pub fn new() -> Self {
         Self {
@@ -24,7 +29,7 @@ impl InMemoryStore {
 
 impl Store for InMemoryStore {
     async fn set(&self, key: &Ticket, session_state: &SessionState) -> anyhow::Result<()> {
-        log::info!("Storing {key:?} for {}", session_state.username);
+        log::debug!("Storing {key:?} for {}", session_state.username);
         self.store
             .lock()
             .await
@@ -42,6 +47,89 @@ impl Store for InMemoryStore {
     }
 }
 
+pub struct RedisStore {
+    conn: MultiplexedConnection,
+}
+
+impl RedisStore {
+    pub async fn new<T>(params: T) -> anyhow::Result<Self>
+    where
+        T: IntoConnectionInfo,
+    {
+        Ok(Self {
+            conn: redis::Client::open(params)
+                .context("Could not create redis client")?
+                .get_multiplexed_async_connection()
+                .await
+                .context("Could not connect to redis")?,
+        })
+    }
+}
+
+impl Store for RedisStore {
+    async fn set(&self, key: &Ticket, session_state: &SessionState) -> anyhow::Result<()> {
+        log::debug!(
+            "Storing session {} for {} to redis",
+            key.id,
+            session_state.username
+        );
+
+        if let Some(exp) = session_state.expiration() {
+            log::debug!(
+                "Session {key} expires at {exp} (at most at {exp_max})",
+                key = key.id,
+                exp_max = session_state.session_expires_at.unwrap_or(exp)
+            );
+            self.conn
+                .clone()
+                .set_options(
+                    &key.id,
+                    key.encrypt(&session_state)?,
+                    SetOptions::default().with_expiration(SetExpiry::EXAT(exp.as_second() as u64)),
+                )
+                .await
+                .context("Could not set key")
+                .map(|_| ())
+        } else {
+            self.conn
+                .clone()
+                .set(&key.id, key.encrypt(&session_state)?)
+                .await
+                .context("Could not set key")
+                .map(|_| ())
+        }
+    }
+
+    async fn get(&self, key: &Ticket) -> anyhow::Result<Option<SessionState>> {
+        log::debug!("Fetching session {key} from redis", key = key.id);
+        let session_state = self
+            .conn
+            .clone()
+            .get(&key.id) // get_ex (https://redis.io/docs/latest/commands/getex/)
+            .await
+            .context("Could not get key")?
+            .map(|s| key.decrypt::<_, SessionState>(&s))
+            .transpose();
+
+        if let Ok(Some(session_state)) = &session_state {
+            if let Some(exp) = session_state.expiration() {
+                log::debug!(
+                    "Session {key} expires at {exp} (at most at {exp_max})",
+                    key = key.id,
+                    exp_max = session_state.session_expires_at.unwrap_or(exp)
+                );
+                self.conn
+                    .clone()
+                    .expire_at(&key.id, exp.as_second())
+                    .await
+                    .context("Could not set key expiration")?;
+            }
+        }
+
+        session_state
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::session::{SessionState, Ticket};
@@ -52,7 +140,8 @@ mod tests {
         let store = InMemoryStore::new();
         let ticket = Ticket::generate("cookie_name").unwrap();
 
-        let session_state = SessionState::new("username", "at".into(), None, Some("rt".into()));
+        let session_state =
+            SessionState::new("username", "at".into(), None, Some("rt".into()), None, None);
         store.set(&ticket, &session_state).await.unwrap();
 
         let loaded_session_state = store.get(&ticket).await.unwrap().unwrap();
